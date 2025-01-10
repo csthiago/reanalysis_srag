@@ -1,0 +1,718 @@
+---
+title: "Reanalysis Paper-Frontiers"
+author: "Thiago Cerqueira-Silva"
+format: 
+  html: 
+    toc: true
+    toc-location: left
+    self-contained: true
+    code-fold: true
+    code-summary: "Show the code"
+execute: 
+  warning: false
+editor_options: 
+  chunk_output_type: inline
+---
+
+## Data preparation
+
+Read datasets
+
+```{r}
+pacman::p_load(tidyverse, 
+               gtsummary, 
+               finalfit, 
+               survival, 
+               kableExtra,
+               ggbreak,
+               arrow)
+
+# custom function to recategorise
+fct_case_when <- function(...) {
+  args <- as.list(match.call())
+  levels <- sapply(args[-1], function(f) f[[3]])
+  levels <- levels[!is.na(levels)]
+  factor(tidytable::case_when(...), levels = levels)
+}
+
+srag <- fs::dir_ls(
+  path = ".",
+  regexp = "INFLUD2[0-3].*" # restricting to 2020 to 2023, if you want to use 2024, change [0-4]
+) |>
+  map_dfr(~ arrow::read_parquet(.x) |> mutate(across(everything(), as.character)))
+```
+
+Select variables to use in the analysis
+
+```{r}
+#| echo: false
+srag_dt <- srag |>
+  select(
+    DT_NOTIFIC,
+    DT_SIN_PRI,
+    DT_INTERNA,
+    DT_EVOLUCA,
+    EVOLUCAO,
+    CLASSI_FIN,
+    DT_NASC,
+    NU_IDADE_N,
+    TP_IDADE,
+    CS_RACA,
+    CS_SEXO,
+    CS_ESCOL_N,
+    CS_ZONA,
+    FATOR_RISC:OBESIDADE,
+    SG_UF,
+    CO_MUN_RES,
+    VACINA_COV:DOSE_2REF
+  ) |>
+  mutate( #convert to date
+    DT_NOTIFIC = dmy(DT_NOTIFIC),
+    DT_SIN_PRI = dmy(DT_SIN_PRI),
+    DT_INTERNA = dmy(DT_INTERNA),
+    DT_EVOLUCA = dmy(DT_EVOLUCA),
+    DOSE_1_COV = dmy(DOSE_1_COV),
+    DOSE_2_COV = dmy(DOSE_2_COV),
+    DOSE_REF = dmy(DOSE_REF),
+    IDADE = case_when( #create age variable, it is combination of two variables
+      TP_IDADE != "3" ~ 0,
+      TP_IDADE == "3" ~ as.numeric(NU_IDADE_N)
+    )
+  ) |>
+  # Create variables related to time
+  mutate(
+    t_0 = DT_INTERNA - DT_SIN_PRI, #time between symptom onset to hospitalisation
+    t_1 = DT_EVOLUCA - DT_SIN_PRI, #Time used by the paper to select individuals (symptom onset to death/discharge)
+    t_2 = DT_EVOLUCA - DT_INTERNA, #time between hospitalisation to death/discharge
+    t_dose_1 = DOSE_1_COV - DT_SIN_PRI, #dose 1
+    t_dose_2 = DOSE_2_COV - DT_SIN_PRI, #dose 2
+    t_dose_3 = DOSE_REF - DT_SIN_PRI #dose 3
+  ) |>
+  # filter to COVID-19 (classfin=5)
+  tidylog::filter(
+    CLASSI_FIN == 5) |> 
+  tidylog::filter(!is.na(DT_EVOLUCA)) |> # keep only individuals with discharge/death date
+  tidylog::filter( # filter symptom onset/death/discharge between2020 and 2023 to be equal to the paper
+    DT_EVOLUCA>="2020-01-01",
+    DT_SIN_PRI>="2020-01-01",
+         DT_EVOLUCA<"2024-01-01",
+         DT_SIN_PRI<"2024-01-01") |> 
+  tidylog::filter(CS_SEXO != "I") |> 
+  mutate(
+  vaccination_status = case_when(
+    is.na(t_dose_1) ~ "unvax",
+    t_dose_3<0 ~ "3_doses before",
+    t_dose_2<0 ~ "2_doses before",
+    t_dose_1<0 ~ "1_dose before",
+    t_dose_3>=0 ~ "3_doses after",
+    t_dose_2>=0 ~ "2_doses after",
+    t_dose_1>=0 ~ "1_dose after"
+  ),
+  vaccination_status = fct_relevel(vaccination_status,"unvax"), #put unvaccinated as reference level
+  vaccination_only_before = case_when(
+    is.na(t_dose_1) ~ "unvax",
+    t_dose_3<0 ~ "3_doses before",
+    t_dose_2<0 ~ "2_doses before",
+    t_dose_1<0 ~ "1_dose before",
+    t_dose_1>=0 ~ "unvax"
+  ),
+  vaccination_only_before = fct_relevel(vaccination_only_before,"unvax"), #put unvaccinated as reference level
+  death = if_else(EVOLUCAO %in% c("2","3"), # 2 = death due to SARS, 3= death due to other causes
+                  1,
+                  0),
+  start = as.numeric(DT_SIN_PRI), #convert to numeric for the models
+  stop = as.numeric(DT_EVOLUCA), #convert to numeric for the models
+  time_end = stop - start, #differene between symptom onset to end
+  time_start = 0, #wrong approach using time since symptom onset
+  # change time to 1 (increase 1 day in date of death) if death =symptom onset
+  time_end = if_else(time_end==0,1,time_end),
+  year = as.factor(year(DT_SIN_PRI)) #variable of year of symptom onset
+) 
+```
+
+After selection:
+
+1\) 1,551,354 records were removed for not being classified as COVID-19
+
+2\) 214,103 were removed from lack date of discharge/death (10%)
+
+3\) 1,129 rows were removed because symptom onset or discharge/death did not fall in 2020 to 2023.
+
+4\) 202 rows removed because no information about sex
+
+The final sample is: 2,001,099
+
+```{r}
+# Recoding variables
+srag_dt <- srag_dt |> 
+  mutate(
+    FATOR_RISC = case_when(
+      FATOR_RISC == "2"~ "N",
+      FATOR_RISC == "1"~ "S",
+      TRUE ~ FATOR_RISC
+    ),
+    FATOR_RISC = fct_case_when(
+      FATOR_RISC == "N" ~ "No",
+      FATOR_RISC == "S" ~ "Yes"
+    ),
+    Region = fct_case_when(
+      str_sub(CO_MUN_RES,1,1) == "1" ~ "North",
+      str_sub(CO_MUN_RES,1,1) == "2" ~ "Northeast",
+      str_sub(CO_MUN_RES,1,1) == "3" ~ "Southeast",
+      str_sub(CO_MUN_RES,1,1) == "4" ~ "South",
+      str_sub(CO_MUN_RES,1,1) == "5" ~ "Central-west",
+      TRUE ~ "Missing"
+    ),
+    CS_ZONA = fct_case_when(
+      CS_ZONA == "1" ~ "Urban",
+      CS_ZONA == "2" ~ "Rural",
+      CS_ZONA == "3" ~ "Periurban",
+      TRUE ~ "Missing"
+    ),
+    CS_ESCOL_N = fct_case_when(
+      CS_ESCOL_N == "0" ~ "No school",
+      CS_ESCOL_N == "1" ~ "1-5",
+      CS_ESCOL_N == "2" ~ "6-9",
+      CS_ESCOL_N == "3" ~ "10-11",
+      CS_ESCOL_N == "4" ~ "12+",
+      TRUE ~ "Missing"
+    ),
+    CS_RACA = fct_case_when(
+      CS_RACA == "1" ~ "White",
+      CS_RACA == "2" ~ "Black",
+      CS_RACA == "3" ~ "Asian",
+      CS_RACA == "4" ~ "Mixed",
+      CS_RACA == "5" ~ "Indigenous",
+      TRUE ~ "Missing"
+    ),
+    CS_RACA_CAT = 
+      fct_case_when(
+        CS_RACA == "White" ~ "White",
+        CS_RACA %in% c("Black","Asian","Mixed","Indigenous") ~ "Non-white",
+        TRUE ~ "Missing" ),
+    CS_SEXO = na_if(CS_SEXO,"I"),
+    CS_SEXO = fct_na_value_to_level(CS_SEXO,"Missing"),
+    Hospitalisation = if_else(!is.na(DT_INTERNA),
+                              1,
+                              0),
+    IDADE_CAT = if_else(
+      IDADE>=65,
+      "65+",
+      "0-64"
+    ),
+    IDADE_BIN = cut(IDADE, breaks = c(0,10,20,30,40,50,60,70,80,Inf),
+                    include.lowest=T)
+  ) |> 
+  droplevels() |> 
+  rename(
+    Age = IDADE,
+    Age_categorised = IDADE_CAT,
+    Age_binned = IDADE_BIN,
+    Sex = CS_SEXO,
+    Race_ethnicity = CS_RACA_CAT,
+    Education_level = CS_ESCOL_N,
+    Risk_factor = FATOR_RISC,
+    Area = CS_ZONA
+  )
+```
+
+# Distribution of time between symptom onset to death or discharge
+
+Figure 1 from the The Conversation article
+
+```{r}
+srag_dt |> 
+  mutate(t_1 = as.numeric(t_1)) |> 
+  ggplot(aes(t_1)) +
+  geom_histogram(binwidth = 7, color="white")+
+  labs(x="Time between symptom onset to Death or Discharge (days)", y = "Number of cases per week")+
+  scale_x_continuous(breaks = c(0,360,390,730,760))+
+  scale_y_cut(c(5e2,5e4),which = c(1,3), scales = c(0.5,2), space = c(0.4,0.5))+
+  coord_cartesian(clip = "off", ylim = c(0,620208), xlim = c(0,800)) +
+  scale_y_continuous(labels=scales::comma)+
+  firatheme::theme_fira()+
+  theme(panel.grid.major = element_line(color="gray50"))
+```
+
+Here is the same figure using logarithmic scale to highlight the spikes
+
+```{r}
+srag_dt |> 
+  mutate(t_1 = as.numeric(t_1)) |> 
+  ggplot(aes(t_1)) +
+  geom_histogram(binwidth = 7, color="white")+
+  labs(x="Time between symptom onset to Death or Discharge (days)", y = "Number of cases per week")+
+  scale_x_continuous(breaks = c(0,90,180,365,545,730,800))+
+  scale_y_log10(labels=scales::comma)+
+  firatheme::theme_fira()
+```
+
+Zooming specific to the interval around 1 year
+
+```{r}
+srag_dt |> 
+  filter(t_1>=300, t_1<=419) |> 
+  mutate(
+    t_1 = as.numeric(t_1),
+    t_1_cat = cut(t_1,breaks=seq(300,420,7), include.lowest=T)) |> 
+  count(t_1_cat) |> 
+  filter(!is.na(t_1_cat)) |> 
+  ggplot(aes(t_1_cat,n)) +
+  geom_col()+
+  labs(x="Time between symptom onset to Death or Discharge (days)", y = "Number of cases per week")+
+  firatheme::theme_fira()+
+  theme(axis.text.x = element_text(angle=90,
+                                   vjust = 0.5))
+```
+
+Zooming specific to the interval around 2 years
+
+```{r}
+srag_dt |> 
+  filter(t_1>=680, t_1<=800) |> 
+  mutate(
+    t_1 = as.numeric(t_1),
+    t_1_cat = cut(t_1,breaks=seq(680,800,7), include.lowest=T)) |> 
+  count(t_1_cat) |> 
+  filter(!is.na(t_1_cat)) |> 
+  ggplot(aes(t_1_cat,n)) +
+  geom_col()+
+  labs(x="Time between symptom onset to Death or Discharge (days)", y = "Number of cases per week")+
+  firatheme::theme_fira()+
+  theme(axis.text.x = element_text(angle=90,
+                                   vjust = 0.5))
+```
+
+The graphs show clearly a peak around 1 year and 2 year, likely reflecting errors in the "year" of one of the dates. The SARS system has some rules related to the data insertion, the date of discharge/death always must be greater than the date of symptom onset, for this reason it is impossible to have errors in the opposite direction.
+
+We can consider the data is correct and proceed with the analysis to replicate the questions posed by the article.
+
+It is necessary to split the time contribution of each person in the intervals (0-90, 91-365, and ≥365 days)
+
+Split the data in individuals with time 0-90, 91-365, 366+
+
+Ps.: Here we removed missing data on Region (302 rows). As we can see, region and sex had a small number of missing data that were also not reported in the paper.
+
+```{r}
+srag_dt <- srag_dt |> 
+  tidylog::filter(Sex!="Missing",
+         Region!="Missing") |> 
+  droplevels()
+splited_dt <- survSplit(Surv(time_end,death)~., srag_dt,
+          cut = c(90,365),
+          start = "tstart",
+          end = "tstop",
+          episode = "timegroup",
+          id="id")
+```
+
+```{r}
+splited_dt <- splited_dt |> 
+  mutate(start = start + tstart,
+         stop = start + tstop,
+         timegroup = as.factor(timegroup),
+         timegroup_cat = fct_case_when(
+           timegroup == "1" ~ "0-90",
+           timegroup == "2" ~ "91-365",
+           timegroup == "3" ~ "366+"
+         ),
+         time_since_symp = tstop - tstart) |> 
+  rename(
+    start_cal = start,
+    stop_cal = stop,
+    start_symptom = tstart,
+    stop_symptom = tstop
+  )
+
+splited_dt <- splited_dt |> 
+  mutate(
+  vaccination_status_wrong = fct_case_when(
+    vaccination_status %in%
+      c("3_doses before","3_doses after") ~ "3 doses",
+        vaccination_status %in%
+      c("2_doses before","2_doses after") ~ "2 doses",
+        vaccination_status %in%
+      c("1_dose before","1_dose after") ~ "1 doses",
+    TRUE ~ "unvax"),
+  vaccination_status_wrong = fct_relevel(vaccination_status_wrong,"unvax"),
+
+  )
+```
+
+The characteristics distribution by interval (overall)
+
+```{r}
+splited_dt |> 
+  select(
+    Age,
+    Age_categorised,
+    Age_binned,
+    Race_ethnicity,
+    Sex,
+    Education_level,
+    Area,
+    Region,
+    Hospitalisation,
+    year,
+    Risk_factor,
+    vaccination_status,
+    vaccination_only_before,
+    vaccination_status_wrong,
+    timegroup_cat,
+
+  ) |> 
+  tbl_summary(by = timegroup_cat)
+```
+
+The characteristics distribution by interval (overall), breaking by status (Death/Alive)
+
+```{r}
+splited_dt |> 
+  select(
+    Age,
+    Age_categorised,
+    Age_binned,
+    Race_ethnicity,
+    Sex,
+    Education_level,
+    Area,
+    Region,
+    Hospitalisation,
+    year,
+    Risk_factor,
+    vaccination_status,
+    vaccination_only_before,
+    vaccination_status_wrong,
+    timegroup_cat,
+    death
+) |>
+  mutate(death = if_else(death==1,"Death","Alive")) |> 
+  tbl_strata(
+    strata = timegroup_cat,
+    .tbl_fun =
+      ~ .x |>
+        tbl_summary(by = death),
+    .header = "**{strata}**, N = {n}"
+  )
+```
+
+As we can see, the numbers doesn't align with the numbers from the paper. But in the that paper even the percentages doesn't make sense with "Region" in table 1 summing to a whopping 177%. It is possible the percentages are by line instead column, but even that is not specified.
+
+```{r}
+explanatory = c("vaccination_status", 
+                "vaccination_only_before",
+                "vaccination_status_wrong",
+                "Age",
+                "Age_categorised",
+                "Age_binned",
+                "Sex",
+                "Race_ethnicity",
+                "Education_level",
+                "Region",
+                "Risk_factor",
+                "Hospitalisation",
+                "year")
+explanatory_multi = c("vaccination_status_wrong", 
+                "Age",
+                "Sex",
+                "Race_ethnicity",
+                "Hospitalisation",
+                "Education_level",
+                "Region",
+                "Risk_factor")
+
+explanatory_multi_correct = c("vaccination_status", 
+                "Age_binned",
+                "Sex",
+                "Race_ethnicity",
+                "Education_level",
+                "Risk_factor", 
+                "Region")
+
+explanatory_multi_correct_wrong = c("vaccination_status", 
+                "Age_binned",
+                "Sex",
+                "Race_ethnicity",
+                "Education_level",
+                "Risk_factor", 
+                "Region",
+                "year")
+
+dependent = "Surv(start_cal, stop_cal, death)"
+
+dependent_wrong = "Surv(time_since_symp, death)"
+
+```
+
+# Models using the correct timescale (Calendar Time)
+
+Additional information about the problems with timescale in the cox model can be seen at:
+
+[Cox regression using a calendar time scale was unbiased in simulations of COVID-19 vaccine effectiveness & safety](https://doi.org/10.1016/j.jclinepi.2023.02.012)
+
+Additionally, we also show graphically the problems with this approach in the end of this document.
+
+The choice of predictors in the Frontiers paper is also wrong in multiple aspects. The first is the categorisation of vaccination status and the second is the inclusion of "hospitalisation" as a predictor. The database only captures hospitalised patients or individuals who die without hospitalisation, once any association found with this variable is due to the way the system works. The age variable was used as continuous variable considering a linear relationship between age and risk of death. However, the relationship between age and death is a U (Higher risk in the extreme ages) or it increase exponentially in the older ages.
+
+In all models the univariable analysis of vaccination and death will most result in vaccination with increased risk of death, but this is only because the vaccine availability to older person/adults in the initial period of pandemic.
+
+## 0-90 days
+
+### Calendar time with wrong predictors
+
+```{r}
+splited_dt |> 
+  filter(timegroup == "1") |> 
+  finalfit(dependent, explanatory, explanatory_multi = explanatory_multi)->t1
+
+kable(t1, row.names=FALSE, align=c("l", "l", "r", "r", "r", "r"),
+            booktabs=TRUE) %>% 
+    kable_styling(font_size=8)
+```
+
+### Calendar time with right predictors
+
+```{r}
+splited_dt |> 
+  filter(timegroup == "1") |> 
+  finalfit(dependent, explanatory, explanatory_multi = explanatory_multi_correct)->t1
+
+kable(t1, row.names=FALSE, align=c("l", "l", "r", "r", "r", "r"),
+            booktabs=TRUE) %>% 
+    kable_styling(font_size=8)
+```
+
+## 91-365 days
+
+### Calendar time with wrong predictors
+
+```{r}
+splited_dt |> 
+  filter(timegroup == "2") |> 
+  finalfit(dependent, explanatory, explanatory_multi = explanatory_multi)->t1
+
+t1[51,4] <- "-" # no events in this category, remove the 0 to infinite HR
+kable(t1, row.names=FALSE, align=c("l", "l", "r", "r", "r", "r"),
+            booktabs=TRUE) %>% 
+    kable_styling(font_size=8)
+```
+
+### Calendar time with right predictors
+
+```{r}
+splited_dt |> 
+  filter(timegroup == "2") |> 
+  finalfit(dependent, explanatory, explanatory_multi = explanatory_multi_correct)->t1
+t1[51,4] <- "-" # no events in this category, remove the 0 to infinite HR
+kable(t1, row.names=FALSE, align=c("l", "l", "r", "r", "r", "r"),
+            booktabs=TRUE) %>% 
+    kable_styling(font_size=8)
+```
+
+## 366+ days
+
+### Calendar time with wrong predictors
+
+```{r}
+splited_dt |> 
+  filter(timegroup == "3") |> 
+  finalfit(dependent, explanatory, explanatory_multi = explanatory_multi)->t1
+
+kable(t1, row.names=FALSE, align=c("l", "l", "r", "r", "r", "r"),
+            booktabs=TRUE) %>% 
+    kable_styling(font_size=8)
+```
+
+### Calendar time with right predictors
+
+```{r}
+splited_dt |> 
+  filter(timegroup == "3") |> 
+  finalfit(dependent, explanatory, explanatory_multi = explanatory_multi_correct)->t1
+
+kable(t1, row.names=FALSE, align=c("l", "l", "r", "r", "r", "r"),
+            booktabs=TRUE) %>% 
+    kable_styling(font_size=8)
+```
+
+# Models using wrong approach (time since symptom onset)
+
+## 0-90 days
+
+### Wrong time scale with wrong predictors
+
+```{r}
+splited_dt |> 
+  filter(timegroup == "1") |> 
+  finalfit(dependent_wrong, explanatory, explanatory_multi = explanatory_multi)->t1
+
+kable(t1, row.names=FALSE, align=c("l", "l", "r", "r", "r", "r"),
+            booktabs=TRUE) %>% 
+    kable_styling(font_size=8)
+```
+
+### Wrong time scale with right predictors
+
+```{r}
+splited_dt |> 
+  filter(timegroup == "1") |> 
+  finalfit(dependent_wrong, explanatory, explanatory_multi = explanatory_multi_correct_wrong)->t1
+
+kable(t1, row.names=FALSE, align=c("l", "l", "r", "r", "r", "r"),
+            booktabs=TRUE) %>% 
+    kable_styling(font_size=8)
+```
+
+## 91-365 days
+
+### Wrong time scale with wrong predictors
+
+```{r}
+splited_dt |> 
+  filter(timegroup == "2") |> 
+  finalfit(dependent_wrong, explanatory, explanatory_multi = explanatory_multi)->t1
+
+kable(t1, row.names=FALSE, align=c("l", "l", "r", "r", "r", "r"),
+            booktabs=TRUE) %>% 
+    kable_styling(font_size=8)
+```
+
+### Wrong time scale with right predictors
+
+```{r}
+splited_dt |> 
+  filter(timegroup == "2") |> 
+  finalfit(dependent_wrong, explanatory, explanatory_multi = explanatory_multi_correct_wrong)->t1
+
+kable(t1, row.names=FALSE, align=c("l", "l", "r", "r", "r", "r"),
+            booktabs=TRUE) %>% 
+    kable_styling(font_size=8)
+```
+
+## 366+ days
+
+### Wrong time scale with wrong predictors
+
+```{r}
+splited_dt |> 
+  filter(timegroup == "3") |> 
+  finalfit(dependent_wrong, explanatory, explanatory_multi = explanatory_multi)->t1
+
+kable(t1, row.names=FALSE, align=c("l", "l", "r", "r", "r", "r"),
+            booktabs=TRUE) %>% 
+    kable_styling(font_size=8)
+```
+
+### Wrong time scale with right predictors
+
+```{r}
+splited_dt |> 
+  filter(timegroup == "3") |> 
+  finalfit(dependent_wrong, explanatory, explanatory_multi = explanatory_multi_correct)->t1
+
+kable(t1, row.names=FALSE, align=c("l", "l", "r", "r", "r", "r"),
+            booktabs=TRUE) %>% 
+    kable_styling(font_size=8)
+```
+
+# Why time since symptom onset is wrong?
+
+The distribution with calendar time in the cases with more than one year.
+
+```{r}
+splited_dt |> 
+  filter(timegroup == "3") |> 
+  mutate(duration = stop_symptom - start_symptom) |> filter(death==1) |> 
+  arrange(DT_SIN_PRI) |> 
+  mutate(case_rank = row_number()) |> 
+  ggplot()+
+  geom_segment(aes(x=DT_SIN_PRI,xend=DT_EVOLUCA,
+                   y=case_rank,yend=case_rank), alpha=0.3, linewidth=0.1)+
+  geom_point(aes(x=DT_EVOLUCA,y=case_rank,color="Death"), size=1.5,alpha=0.3)+
+    geom_point(aes(x=DT_SIN_PRI,y=case_rank,color="Symptom"), size=1.5,alpha=0.3)+
+  labs(y="No#", x="Date of Symptom", color="")+
+  firatheme::theme_fira()+
+  theme(legend.position = "bottom")
+
+```
+
+Using time since symptom onset, individuals symptomatic during 2020 will be compared to those from 2021/22/23, but there isn't vaccine availability in 2020 / Very different scenario in each year. The comparison made in the paper represent this:
+
+```{r}
+splited_dt |> 
+  filter(timegroup == "3") |> 
+  mutate(duration = stop_symptom - start_symptom) |> filter(death==1) |> 
+  arrange(DT_SIN_PRI) |> 
+  mutate(case_rank = row_number()) |> 
+  ggplot()+
+  geom_segment(aes(x=0,xend=duration,
+                   y=case_rank,yend=case_rank), alpha=0.3, linewidth=0.1)+
+  geom_point(aes(x=duration,y=case_rank,color="Death"), size=1.5,alpha=0.3)+
+  labs(y="No#", x="Time since symptom onset to death", color="")+
+  firatheme::theme_fira()+
+  theme(legend.position = "bottom")
+
+```
+
+# Other problematic points in the paper
+
+-   Lack of a flowchart describing the selection process: Inclusion/Exclusion
+-   Lack of transparency in the description of vaccination status
+-   
+-   The tables only show the number of individuals who died, not the full sample, the % doesn't add to 100%
+-   Use of variables with high amount of missing data (Education level has more than 60% of missing)
+-   As explained before, wrong choice of predictors and type of analysis not appropriate for the question
+-   The paper suffers of the Table 2 fallacy, claiming causality for each variable included in the analysis
+
+The data is clearly misinterpreted.
+
+As seen in Figure 1 of the paper. The drop in survival happens sharply at 1 year after "symptom onset". There is no biological reason for this, people do not have a expire that in each after this date they will die. Another problem possible to extract from this figure is the difference between follow-up time, there is no vaccinated individual followed after 600 days, and that is only because the vaccine was implemented in 2021.
+
+![](Screenshot 2025-01-10 at 19.10.54.png)
+
+# Additional models used in the paper
+
+Example of the results using the Cox mixed effects and Frailty models
+
+## Example using the group ≥1 year
+
+```{r}
+t3 <- splited_dt |> 
+  filter(timegroup == "3")
+
+library(coxme)
+
+
+```
+
+## Mixed model
+
+```{r}
+mod <- coxme(Surv(start_cal,stop_cal, death) ~ 
+               (vaccination_status_wrong)+
+        Age+
+        Sex+
+        Race_ethnicity+
+        Hospitalisation +
+        Education_level+
+        Risk_factor+
+          (1|CO_MUN_RES), t3) 
+summary(mod)
+
+```
+
+## Frailty
+
+```{r}
+mod <- coxph(Surv(start_cal,stop_cal, death) ~ 
+               (vaccination_status_wrong)+
+        Age+
+        Sex+
+        Race_ethnicity+
+        Hospitalisation +
+        Education_level+
+        Risk_factor+
+          frailty(CO_MUN_RES), t3) 
+summary(mod)
+```
+
