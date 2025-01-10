@@ -45,7 +45,6 @@ srag <- fs::dir_ls(
 Select variables to use in the analysis
 
 ```{r}
-#| echo: false
 srag_dt <- srag |>
   select(
     DT_NOTIFIC,
@@ -491,7 +490,7 @@ splited_dt |>
   filter(timegroup == "2") |> 
   finalfit(dependent, explanatory, explanatory_multi = explanatory_multi)->t1
 
-t1[51,4] <- "-" # no events in this category, remove the 0 to infinite HR
+t1[51,4] <- "-" # not converging because very low number of events in this category, remove the 0 to infinite HR
 kable(t1, row.names=FALSE, align=c("l", "l", "r", "r", "r", "r"),
             booktabs=TRUE) %>% 
     kable_styling(font_size=8)
@@ -503,7 +502,7 @@ kable(t1, row.names=FALSE, align=c("l", "l", "r", "r", "r", "r"),
 splited_dt |> 
   filter(timegroup == "2") |> 
   finalfit(dependent, explanatory, explanatory_multi = explanatory_multi_correct)->t1
-t1[51,4] <- "-" # no events in this category, remove the 0 to infinite HR
+t1[51,4] <- "-" # not converging because very low number of events in this category, remove the 0 to infinite HR
 kable(t1, row.names=FALSE, align=c("l", "l", "r", "r", "r", "r"),
             booktabs=TRUE) %>% 
     kable_styling(font_size=8)
@@ -668,7 +667,7 @@ The data is clearly misinterpreted.
 
 As seen in Figure 1 of the paper. The drop in survival happens sharply at 1 year after "symptom onset". There is no biological reason for this, people do not have a expire that in each after this date they will die. Another problem possible to extract from this figure is the difference between follow-up time, there is no vaccinated individual followed after 600 days, and that is only because the vaccine was implemented in 2021.
 
-![](Screenshot 2025-01-10 at 19.10.54.png)
+![](fig.png)
 
 # Additional models used in the paper
 
